@@ -1093,6 +1093,22 @@ impl ServerApi {
         request: &warp_multi_agent_api::Request,
     ) -> std::result::Result<AIOutputStream<warp_multi_agent_api::ResponseEvent>, Arc<AIApiError>>
     {
+        // llama_backend integration: when WARP_LLAMA_URL is set, divert this
+        // turn to a local OpenAI-compatible server and return its stream
+        // verbatim, mapping anyhow errors into Arc<AIApiError>.
+        if let Some(stream) = llama_backend::dispatch_if_enabled(request) {
+            let mapped = stream.map(|res| {
+                res.map_err(|e| Arc::new(AIApiError::Other(e)))
+            });
+            cfg_if::cfg_if! {
+                if #[cfg(target_family = "wasm")] {
+                    return Ok(mapped.boxed_local());
+                } else {
+                    return Ok(mapped.boxed());
+                }
+            }
+        }
+
         let auth_token = self
             .get_or_refresh_access_token()
             .await
