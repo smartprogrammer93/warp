@@ -134,3 +134,129 @@ fn collect_appended_text(events: &[warp_multi_agent_api::ResponseEvent]) -> Stri
     }
     out
 }
+
+fn extract_conversation_id(events: &[warp_multi_agent_api::ResponseEvent]) -> Option<String> {
+    events.iter().find_map(|e| match &e.r#type {
+        Some(REType::Init(init)) => Some(init.conversation_id.clone()),
+        _ => None,
+    })
+}
+
+fn extract_tool_calls<'a>(
+    events: &'a [warp_multi_agent_api::ResponseEvent],
+) -> Vec<&'a warp_multi_agent_api::message::ToolCall> {
+    events
+        .iter()
+        .filter_map(|e| match &e.r#type {
+            Some(REType::ClientActions(ca)) => Some(ca),
+            _ => None,
+        })
+        .flat_map(|ca| ca.actions.iter())
+        .filter_map(|a| match &a.action {
+            Some(CAction::AddMessagesToTask(am)) => Some(am),
+            _ => None,
+        })
+        .flat_map(|am| am.messages.iter())
+        .filter_map(|m| match &m.message {
+            Some(MMsg::ToolCall(tc)) => Some(tc),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires live llama-server"]
+async fn tool_round_trip_list_tmp_against_real_llama_server() {
+    use warp_multi_agent_api::request::input::{ToolCallResult, tool_call_result};
+    use warp_multi_agent_api::run_shell_command_result::Result as RSCResult;
+    use warp_multi_agent_api::{RunShellCommandResult, ShellCommandFinished};
+
+    ensure_crypto_provider();
+    assert!(std::env::var("WARP_LLAMA_URL").is_ok(), "WARP_LLAMA_URL must be set");
+
+    // ---- Turn 1: prompt that should make the model call run_shell_command. ----
+    let req1 = make_user_query_request(
+        "Use run_shell_command to list the files in /tmp on this machine. Just call the tool, no preamble.",
+    );
+    let events1: Vec<_> = dispatch_if_enabled(&req1)
+        .expect("backend engaged")
+        .collect()
+        .await;
+    let events1: Vec<_> = events1.into_iter().map(|e| e.expect("no errors")).collect();
+    eprintln!("=== Turn 1: {} events ===", events1.len());
+
+    let conv_id = extract_conversation_id(&events1).expect("StreamInit emitted");
+    eprintln!("conv_id = {conv_id}");
+
+    let tcs = extract_tool_calls(&events1);
+    assert!(
+        !tcs.is_empty(),
+        "model should have called a tool; got events: {events1:?}"
+    );
+    let tc = tcs[0];
+    eprintln!("tool_call_id = {}", tc.tool_call_id);
+    let cmd = match tc.tool.as_ref() {
+        Some(warp_multi_agent_api::message::tool_call::Tool::RunShellCommand(rsc)) => {
+            eprintln!("command = {}", rsc.command);
+            rsc.command.clone()
+        }
+        other => panic!("expected RunShellCommand, got {other:?}"),
+    };
+    assert!(
+        cmd.contains("ls") || cmd.contains("/tmp"),
+        "expected ls-like command, got {cmd:?}"
+    );
+
+    // ---- Simulate Warp running the command and posting back the result. ----
+    let fake_stdout = "fileA.txt\nfileB.log\nsubdir/\n";
+    let req2 = Request {
+        metadata: Some(Metadata {
+            conversation_id: conv_id.clone(),
+            ..Default::default()
+        }),
+        input: Some(Input {
+            r#type: Some(InputType::UserInputs(UserInputs {
+                inputs: vec![UserInput {
+                    input: Some(UserInputKind::ToolCallResult(ToolCallResult {
+                        tool_call_id: tc.tool_call_id.clone(),
+                        result: Some(tool_call_result::Result::RunShellCommand(
+                            RunShellCommandResult {
+                                command: cmd.clone(),
+                                result: Some(RSCResult::CommandFinished(
+                                    ShellCommandFinished {
+                                        output: fake_stdout.to_string(),
+                                        exit_code: 0,
+                                        command_id: String::new(),
+                                    },
+                                )),
+                                ..Default::default()
+                            },
+                        )),
+                    })),
+                }],
+            })),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    // ---- Turn 2: model should consume the tool result and summarize. ----
+    let events2: Vec<_> = dispatch_if_enabled(&req2)
+        .expect("backend engaged")
+        .collect()
+        .await;
+    let events2: Vec<_> = events2.into_iter().map(|e| e.expect("no errors")).collect();
+    eprintln!("=== Turn 2: {} events ===", events2.len());
+
+    let summary = collect_appended_text(&events2);
+    eprintln!("=== summary ===\n{summary}\n=== end ===");
+    assert!(!summary.is_empty(), "model should have produced a summary");
+    // The fake output contained "fileA.txt" — model should mention something file-related.
+    assert!(
+        summary.to_lowercase().contains("file")
+            || summary.contains("fileA")
+            || summary.contains("fileB")
+            || summary.contains("subdir"),
+        "summary should reference the listed files, got {summary:?}"
+    );
+}

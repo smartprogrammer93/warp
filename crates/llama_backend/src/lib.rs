@@ -94,8 +94,14 @@ pub fn dispatch_if_enabled(request: &Request) -> Option<DispatchStream> {
             }
         };
 
-        // 3. Translate OpenAI chunks → Warp `ResponseEvent`s.
-        let mut events = translate_response::openai_sse_to_proto_events(raw_sse, conversation_id);
+        // 3. Translate OpenAI chunks → Warp `ResponseEvent`s. Pass the
+        //    store so the translator can persist the assistant turn (text
+        //    + tool_calls) for use in the next follow-up turn.
+        let mut events = translate_response::openai_sse_to_proto_events(
+            raw_sse,
+            conversation_id.clone(),
+            Some((store.clone(), conversation_id)),
+        );
         while let Some(ev) = events.next().await {
             yield ev;
         }

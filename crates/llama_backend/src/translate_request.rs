@@ -21,6 +21,7 @@ use crate::conversation_store::ConversationStore;
 use crate::openai_types::ChatCompletionRequest;
 use crate::tool_registry::tools_for_request;
 use anyhow::{anyhow, Result};
+use serde_json::json;
 use uuid::Uuid;
 use warp_multi_agent_api::request::input::user_inputs::user_input::Input as UserInputKind;
 use warp_multi_agent_api::request::input::Type as InputType;
@@ -85,14 +86,7 @@ pub fn proto_request_to_openai(
                         conv.append_user(q.query.clone());
                     }
                     UserInputKind::ToolCallResult(r) => {
-                        // Phase 4 placeholder: serialize a minimal JSON.
-                        // Replaced with full per-variant serialization in
-                        // Phase 9.
-                        let content = serde_json::to_string(&serde_json::json!({
-                            "tool_call_id": r.tool_call_id,
-                            "_phase4_placeholder": "Phase 9 will produce full JSON shapes per ToolCallResult variant",
-                        }))
-                        .unwrap_or_else(|_| "{}".to_string());
+                        let content = serialize_tool_result(r);
                         conv.append_tool_result(r.tool_call_id.clone(), content);
                     }
                     other => {
@@ -126,6 +120,127 @@ pub fn proto_request_to_openai(
     };
 
     Ok((openai, conversation_id))
+}
+
+/// Serialize a `ToolCallResult` (as it arrives in `Request.input` on a
+/// follow-up turn) into a JSON string the model can read as the `tool` role
+/// content.
+///
+/// Each result variant gets its own shape; the model never has to know about
+/// Warp's protobuf schema, only the per-tool JSON conventions documented in
+/// the system prompt.
+pub fn serialize_tool_result(
+    r: &warp_multi_agent_api::request::input::ToolCallResult,
+) -> String {
+    use warp_multi_agent_api::request::input::tool_call_result::Result as R;
+    use warp_multi_agent_api::run_shell_command_result::Result as RSCResult;
+    use warp_multi_agent_api::read_files_result::Result as ReadResult;
+    use warp_multi_agent_api::search_codebase_result::Result as SearchResult;
+    use warp_multi_agent_api::apply_file_diffs_result::Result as ApplyResult;
+    use warp_multi_agent_api::grep_result::Result as GrepResult;
+    use warp_multi_agent_api::file_glob_v2_result::Result as GlobResult;
+    use warp_multi_agent_api::call_mcp_tool_result::Result as McpResult;
+
+    let v = match &r.result {
+        Some(R::RunShellCommand(rsc)) => match &rsc.result {
+            Some(RSCResult::CommandFinished(f)) => json!({
+                "command": rsc.command,
+                "stdout": f.output,
+                "exit_code": f.exit_code,
+            }),
+            Some(RSCResult::LongRunningCommandSnapshot(_)) => json!({
+                "command": rsc.command,
+                "long_running": true,
+                "note": "command is still running; use read_shell_command_output to fetch output (not exposed in v0.1)",
+            }),
+            Some(RSCResult::PermissionDenied(_)) => json!({
+                "command": rsc.command,
+                "permission_denied": true,
+            }),
+            None => json!({"command": rsc.command, "result": null}),
+        },
+        Some(R::ReadFiles(rf)) => match &rf.result {
+            Some(ReadResult::TextFilesSuccess(s)) => json!({
+                "files": s.files.iter().map(|f| json!({
+                    "path": f.file_path,
+                    "content": f.content,
+                })).collect::<Vec<_>>()
+            }),
+            Some(ReadResult::AnyFilesSuccess(s)) => json!({
+                "files_count": s.files.len(),
+                "note": "binary or non-text files; content not surfaced in v0.1",
+            }),
+            Some(ReadResult::Error(e)) => json!({"error": e.message}),
+            None => json!({"error": "(empty result)"}),
+        },
+        Some(R::SearchCodebase(sc)) => match &sc.result {
+            Some(SearchResult::Success(s)) => json!({
+                "files": s.files.iter().map(|f| json!({
+                    "path": f.file_path, "content": f.content,
+                })).collect::<Vec<_>>()
+            }),
+            Some(SearchResult::Error(e)) => json!({"error": e.message}),
+            None => json!({"error": "(empty result)"}),
+        },
+        Some(R::ApplyFileDiffs(af)) => match &af.result {
+            Some(ApplyResult::Success(s)) => json!({
+                "updated_files": s.updated_files_v2.iter().map(|u| json!({
+                    "path": u.file.as_ref().map(|f| f.file_path.clone()).unwrap_or_default(),
+                    "edited_by_user": u.was_edited_by_user,
+                })).collect::<Vec<_>>(),
+                "deleted_files": s.deleted_files.iter().map(|d| d.file_path.clone()).collect::<Vec<_>>(),
+            }),
+            Some(ApplyResult::Error(e)) => json!({"error": e.message}),
+            None => json!({"error": "(empty result)"}),
+        },
+        Some(R::Grep(g)) => match &g.result {
+            Some(GrepResult::Success(s)) => json!({
+                "matches": s.matched_files.iter().map(|f| json!({
+                    "path": f.file_path,
+                    "lines": f.matched_lines.iter().map(|l| l.line_number).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>()
+            }),
+            Some(GrepResult::Error(e)) => json!({"error": e.message}),
+            None => json!({"error": "(empty result)"}),
+        },
+        Some(R::FileGlobV2(g)) => match &g.result {
+            Some(GlobResult::Success(s)) => json!({
+                "matched_files": s.matched_files.iter().map(|m| m.file_path.clone()).collect::<Vec<_>>(),
+                "warnings": s.warnings,
+            }),
+            Some(GlobResult::Error(e)) => json!({"error": e.message}),
+            None => json!({"error": "(empty result)"}),
+        },
+        Some(R::CallMcpTool(c)) => match &c.result {
+            Some(McpResult::Success(s)) => json!({
+                "results": s.results.iter().map(serialize_mcp_result_item).collect::<Vec<_>>()
+            }),
+            Some(McpResult::Error(e)) => json!({"error": e.message}),
+            None => json!({"error": "(empty result)"}),
+        },
+        Some(other) => json!({
+            "unhandled_variant": format!("{other:?}"),
+            "note": "this tool-call result variant is not decoded in v0.1; the agent loop should adapt by reading the tool call's effect through other means.",
+        }),
+        None => json!({"empty": true}),
+    };
+    serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn serialize_mcp_result_item(
+    r: &warp_multi_agent_api::call_mcp_tool_result::success::Result,
+) -> serde_json::Value {
+    use warp_multi_agent_api::call_mcp_tool_result::success::result::Result as Inner;
+    match &r.result {
+        Some(Inner::Text(t)) => json!({"text": t.text}),
+        Some(Inner::Image(i)) => json!({
+            "image": {"mime": i.mime_type, "size_bytes": i.data.len()}
+        }),
+        Some(Inner::Resource(res)) => json!({
+            "resource": {"uri": res.uri},
+        }),
+        None => json!({"empty": true}),
+    }
 }
 
 #[cfg(test)]
@@ -305,6 +420,12 @@ mod tests {
         let last = openai.messages.last().unwrap();
         assert_eq!(last.role, OpenAIRole::Tool);
         assert_eq!(last.tool_call_id.as_deref(), Some("call-7"));
-        assert!(last.content.as_deref().unwrap().contains("call-7"));
+        // Content is valid JSON (serialize_tool_result fallback for None
+        // result is `{"empty": true}` — the model still receives a structured
+        // payload).
+        let content = last.content.as_deref().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content)
+            .expect("tool result content must be valid JSON");
+        assert!(parsed.is_object());
     }
 }

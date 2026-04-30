@@ -22,8 +22,11 @@
 //! leading `</think>\s*` artifact from the first non-empty `delta.content`
 //! chunk.
 
+use crate::conversation_store::ConversationStore;
 use crate::error::LlamaBackendError;
-use crate::openai_types::ChatCompletionChunk;
+use crate::openai_types::{
+    ChatCompletionChunk, OpenAIFunctionCall, OpenAIMessage, OpenAIRole, OpenAIToolCall,
+};
 use crate::tool_registry;
 use async_stream::stream;
 use futures::Stream;
@@ -48,6 +51,7 @@ use warp_multi_agent_api::{client_action, ClientAction, Message, ResponseEvent, 
 pub fn openai_sse_to_proto_events<S>(
     sse: S,
     conversation_id: String,
+    store: Option<(ConversationStore, String)>,
 ) -> Pin<Box<dyn Stream<Item = Result<ResponseEvent, anyhow::Error>> + Send>>
 where
     S: Stream<Item = Result<String, LlamaBackendError>> + Send + 'static,
@@ -58,6 +62,7 @@ where
     let agent_msg_id = Uuid::new_v4().to_string();
 
     let s = stream! {
+        let mut accumulated_content = String::new();
         // ---- 1. StreamInit ----
         yield Ok(make_stream_init(&conversation_id));
 
@@ -93,7 +98,7 @@ where
         // ---- 5. Stream chunks ----
         let mut sse = Box::pin(sse);
         let mut tool_calls: BTreeMap<usize, PartialToolCall> = BTreeMap::new();
-        let mut first_content_seen = false;
+        let mut think_stripper = ThinkStripper::default();
         let mut finish_reason_seen: Option<String> = None;
         let mut error: Option<LlamaBackendError> = None;
 
@@ -112,13 +117,9 @@ where
             for choice in chunk.choices {
                 // Drop reasoning_content (Qwen3.6 think block) entirely.
                 if let Some(text_raw) = choice.delta.content {
-                    let text = if !first_content_seen {
-                        first_content_seen = true;
-                        strip_leading_close_think(&text_raw)
-                    } else {
-                        text_raw
-                    };
+                    let text = think_stripper.process(&text_raw);
                     if !text.is_empty() {
+                        accumulated_content.push_str(&text);
                         yield Ok(wrap_action(CAction::AppendToMessageContent(
                             make_append_text(&task_id, &agent_msg_id, &text),
                         )));
@@ -144,6 +145,16 @@ where
             }
         }
 
+        // ---- 5.5 Flush stripper buffer if model never closed </think>
+        // (it didn't use thinking, so everything was real content). ----
+        let flushed = think_stripper.flush();
+        if !flushed.is_empty() {
+            accumulated_content.push_str(&flushed);
+            yield Ok(wrap_action(CAction::AppendToMessageContent(
+                make_append_text(&task_id, &agent_msg_id, &flushed),
+            )));
+        }
+
         // ---- 6. Emit assembled tool calls (if any) ----
         for (_, partial) in tool_calls.iter() {
             match make_tool_call_message(&task_id, partial) {
@@ -163,6 +174,49 @@ where
                     )));
                     break;
                 }
+            }
+        }
+
+        // ---- 6.5 Persist the assistant turn into the conversation store
+        // so the next turn (with a ToolCallResult input) sees the prior
+        // assistant message + tool_calls in OpenAI's expected order. Only
+        // persist on the success path; on error the partial state is
+        // discarded.
+        if error.is_none() {
+            if let Some((store, conv_id)) = &store {
+                let mut conv = store.get_or_init(conv_id, "");
+                let assistant_tool_calls: Vec<OpenAIToolCall> = tool_calls
+                    .values()
+                    .map(|p| OpenAIToolCall {
+                        id: if p.id.is_empty() {
+                            Uuid::new_v4().to_string()
+                        } else {
+                            p.id.clone()
+                        },
+                        kind: "function".to_string(),
+                        function: OpenAIFunctionCall {
+                            name: p.name.clone(),
+                            arguments: p.args.clone(),
+                        },
+                    })
+                    .collect();
+                let content_opt = if accumulated_content.is_empty() {
+                    None
+                } else {
+                    Some(accumulated_content.clone())
+                };
+                let tool_calls_opt = if assistant_tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(assistant_tool_calls)
+                };
+                conv.append_assistant(OpenAIMessage {
+                    role: OpenAIRole::Assistant,
+                    content: content_opt,
+                    tool_calls: tool_calls_opt,
+                    tool_call_id: None,
+                });
+                store.upsert(conv);
             }
         }
 
@@ -277,16 +331,66 @@ fn make_stream_finished_for_error(e: &LlamaBackendError) -> ResponseEvent {
     make_stream_finished(reason)
 }
 
-/// Strip a leading `</think>` (with surrounding whitespace) from the first
-/// content delta — Qwen3.6 leaks the closing think tag into the first
-/// `delta.content` chunk after streaming reasoning. Idempotent and a no-op
-/// for any text that doesn't begin with the artifact.
-fn strip_leading_close_think(s: &str) -> String {
-    let trimmed = s.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("</think>") {
-        rest.trim_start().to_string()
-    } else {
-        s.to_string()
+/// Stateful filter that drops Qwen3.6's pre-`</think>` content noise.
+///
+/// Qwen3.6 (with default reasoning formatting) emits its think block partly
+/// as `delta.reasoning_content` *and* partly as `delta.content` followed by
+/// a literal `</think>` close tag. Stripping only the first delta isn't
+/// enough — the close tag arrives in a later content chunk. So:
+///
+/// - We buffer all content until we see `</think>`. Suffix (after the tag,
+///   left-trimmed) is what gets emitted as the model's actual answer.
+/// - If the stream finishes without ever seeing `</think>`, we flush the
+///   buffer as-is — the model didn't use thinking and everything is real
+///   content.
+#[derive(Default)]
+struct ThinkStripper {
+    close_think_seen: bool,
+    buffer: String,
+    emitted_any: bool,
+}
+
+impl ThinkStripper {
+    fn process(&mut self, delta: &str) -> String {
+        if self.close_think_seen {
+            // After the close tag, lstrip until we've emitted real content.
+            if self.emitted_any {
+                return delta.to_string();
+            }
+            let lstripped = delta.trim_start();
+            if lstripped.is_empty() {
+                return String::new();
+            }
+            self.emitted_any = true;
+            return lstripped.to_string();
+        }
+        self.buffer.push_str(delta);
+        if let Some(pos) = self.buffer.find("</think>") {
+            let suffix = self.buffer.split_off(pos + "</think>".len());
+            self.buffer.clear();
+            self.close_think_seen = true;
+            let lstripped = suffix.trim_start();
+            if lstripped.is_empty() {
+                return String::new();
+            }
+            self.emitted_any = true;
+            return lstripped.to_string();
+        }
+        String::new()
+    }
+
+    /// Called at end of stream. If we never saw `</think>`, the model didn't
+    /// use thinking and everything we buffered is real content.
+    fn flush(&mut self) -> String {
+        if self.close_think_seen {
+            return String::new();
+        }
+        self.close_think_seen = true;
+        let buf = std::mem::take(&mut self.buffer);
+        if !buf.is_empty() {
+            self.emitted_any = true;
+        }
+        buf
     }
 }
 
@@ -317,17 +421,45 @@ mod tests {
     }
 
     #[test]
-    fn strip_leading_close_think_removes_artifact() {
-        assert_eq!(strip_leading_close_think("</think>\n\nhello"), "hello");
-        assert_eq!(strip_leading_close_think("  </think>  text"), "text");
-        assert_eq!(strip_leading_close_think("hello"), "hello");
-        assert_eq!(strip_leading_close_think("</think>"), "");
-        assert_eq!(strip_leading_close_think(""), "");
+    fn think_stripper_buffers_until_close_then_emits_suffix() {
+        let mut s = ThinkStripper::default();
+        // Pre-</think> content: buffered, nothing emitted.
+        assert_eq!(s.process("PONG\n"), "");
+        // Close tag arrives mid-chunk: suffix after </think> emitted, lstripped.
+        assert_eq!(s.process("</think>\n\nFINAL"), "FINAL");
+        // After close: deltas pass through unchanged.
+        assert_eq!(s.process(" answer"), " answer");
+        assert_eq!(s.flush(), "");
+    }
+
+    #[test]
+    fn think_stripper_flushes_buffer_when_close_never_arrives() {
+        let mut s = ThinkStripper::default();
+        // Model never uses </think> — everything we buffered should flush as content.
+        assert_eq!(s.process("hello"), "");
+        assert_eq!(s.process(" world"), "");
+        assert_eq!(s.flush(), "hello world");
+    }
+
+    #[test]
+    fn think_stripper_handles_close_tag_split_across_chunks() {
+        let mut s = ThinkStripper::default();
+        assert_eq!(s.process("...thinking</thi"), "");
+        assert_eq!(s.process("nk>"), "");
+        assert_eq!(s.process("\n\nactual"), "actual");
+    }
+
+    #[test]
+    fn think_stripper_passes_close_after_already_passed() {
+        let mut s = ThinkStripper::default();
+        s.process("</think>real");
+        // Subsequent chunks should pass even if they contain </think> literally.
+        assert_eq!(s.process(" more"), " more");
     }
 
     #[test]
     fn first_event_is_stream_init() {
-        let stream = openai_sse_to_proto_events(sse(&[]), "conv-1".into());
+        let stream = openai_sse_to_proto_events(sse(&[]), "conv-1".into(), None);
         let events = collect_all(stream);
         assert!(events.len() >= 4); // init + begin + create + seed + commit + finished
         let first = &events[0];
@@ -339,7 +471,7 @@ mod tests {
 
     #[test]
     fn empty_stream_emits_full_transactional_envelope_and_done() {
-        let stream = openai_sse_to_proto_events(sse(&[]), "conv-1".into());
+        let stream = openai_sse_to_proto_events(sse(&[]), "conv-1".into(), None);
         let events = collect_all(stream);
         // init + begin + create + seed + commit + finished = 6
         assert_eq!(events.len(), 6, "got {events:?}");
@@ -360,6 +492,7 @@ mod tests {
                 r#"{"choices":[{"finish_reason":"stop","delta":{}}]}"#,
             ]),
             "conv-1".into(),
+            None,
         );
         let events = collect_all(stream);
         // Should see no AppendToMessageContent at all.
@@ -373,39 +506,59 @@ mod tests {
         assert_eq!(appends, 0);
     }
 
+    /// Helper: extract concatenated AgentOutput text from a stream of events.
+    fn collect_text(events: &[ResponseEvent]) -> String {
+        let mut out = String::new();
+        for e in events {
+            let Some(REType::ClientActions(ca)) = &e.r#type else { continue };
+            for a in &ca.actions {
+                if let Some(CAction::AppendToMessageContent(ap)) = &a.action {
+                    if let Some(MMsg::AgentOutput(ao)) =
+                        ap.message.as_ref().and_then(|m| m.message.as_ref())
+                    {
+                        out.push_str(&ao.text);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     #[test]
-    fn leading_close_think_stripped_from_first_content_delta() {
+    fn pre_close_think_content_is_dropped_along_with_the_tag() {
+        // Mirrors what Qwen3.6 actually emits: thinking tokens dump into
+        // delta.content, followed by </think>, followed by the real answer.
         let stream = openai_sse_to_proto_events(
             sse(&[
+                r#"{"choices":[{"delta":{"content":"PONG\n"}}]}"#,
                 r#"{"choices":[{"delta":{"content":"</think>\n\n"}}]}"#,
                 r#"{"choices":[{"delta":{"content":"PONG"}}]}"#,
                 r#"{"choices":[{"finish_reason":"stop","delta":{}}]}"#,
             ]),
             "conv-1".into(),
+            None,
         );
         let events = collect_all(stream);
-        let texts: Vec<String> = events
-            .iter()
-            .filter_map(|e| match &e.r#type {
-                Some(REType::ClientActions(ca)) => Some(ca),
-                _ => None,
-            })
-            .flat_map(|ca| ca.actions.iter())
-            .filter_map(|a| match &a.action {
-                Some(CAction::AppendToMessageContent(ap)) => ap
-                    .message
-                    .as_ref()
-                    .and_then(|m| m.message.as_ref())
-                    .and_then(|mm| match mm {
-                        MMsg::AgentOutput(ao) => Some(ao.text.clone()),
-                        _ => None,
-                    }),
-                _ => None,
-            })
-            .collect();
-        // The first delta was "</think>\n\n" — fully stripped, no append.
-        // Second delta yields "PONG".
-        assert_eq!(texts, vec!["PONG".to_string()]);
+        // The first "PONG\n" is in the think-section and should be dropped.
+        // The "</think>" tag itself is dropped. Only the final "PONG" is emitted.
+        assert_eq!(collect_text(&events), "PONG");
+    }
+
+    #[test]
+    fn no_think_tag_emits_all_content() {
+        // If the model never emits </think>, nothing in delta.content should
+        // be dropped — flush at end-of-stream returns the buffer.
+        let stream = openai_sse_to_proto_events(
+            sse(&[
+                r#"{"choices":[{"delta":{"content":"hello"}}]}"#,
+                r#"{"choices":[{"delta":{"content":" world"}}]}"#,
+                r#"{"choices":[{"finish_reason":"stop","delta":{}}]}"#,
+            ]),
+            "conv-1".into(),
+            None,
+        );
+        let events = collect_all(stream);
+        assert_eq!(collect_text(&events), "hello world");
     }
 
     #[test]
@@ -417,6 +570,7 @@ mod tests {
                 r#"{"choices":[{"finish_reason":"stop","delta":{}}]}"#,
             ]),
             "conv-1".into(),
+            None,
         );
         let events = collect_all(stream);
         let combined: String = events
@@ -450,6 +604,7 @@ mod tests {
                 r#"{"choices":[{"finish_reason":"tool_calls","delta":{}}]}"#,
             ]),
             "conv-1".into(),
+            None,
         );
         let events = collect_all(stream);
         // Find the AddMessagesToTask containing the tool call (NOT the seed AgentOutput one).
@@ -481,10 +636,40 @@ mod tests {
     }
 
     #[test]
+    fn assistant_message_persisted_to_store_with_tool_calls() {
+        use crate::conversation_store::ConversationStore;
+        let store = ConversationStore::new();
+        // Pre-seed a conversation so get_or_init has something to extend.
+        let _ = store.get_or_init("conv-tc", "sys");
+
+        let stream = openai_sse_to_proto_events(
+            sse(&[
+                r#"{"choices":[{"delta":{"content":"Sure, listing now."}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-7","type":"function","function":{"name":"run_shell_command","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
+                r#"{"choices":[{"finish_reason":"tool_calls","delta":{}}]}"#,
+            ]),
+            "conv-tc".into(),
+            Some((store.clone(), "conv-tc".into())),
+        );
+        let _ = collect_all(stream);
+
+        let conv = store.get_or_init("conv-tc", "sys");
+        let last = conv.messages.last().unwrap();
+        assert_eq!(last.role, OpenAIRole::Assistant);
+        assert_eq!(last.content.as_deref(), Some("Sure, listing now."));
+        let tcs = last.tool_calls.as_ref().expect("tool_calls populated");
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].id, "call-7");
+        assert_eq!(tcs[0].function.name, "run_shell_command");
+        assert_eq!(tcs[0].function.arguments, r#"{"command":"ls"}"#);
+    }
+
+    #[test]
     fn finish_reason_length_maps_to_max_token_limit() {
         let stream = openai_sse_to_proto_events(
             sse(&[r#"{"choices":[{"finish_reason":"length","delta":{}}]}"#]),
             "conv-1".into(),
+            None,
         );
         let events = collect_all(stream);
         let last = events.last().unwrap();
