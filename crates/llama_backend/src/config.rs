@@ -18,10 +18,18 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Option<Self> {
-        let url = env::var("WARP_LLAMA_URL").ok()?;
-        let url = url.trim_end_matches('/').to_string();
-        let model =
-            env::var("WARP_LLAMA_MODEL").unwrap_or_else(|_| "default".to_string());
+        // `env::var` returns Ok("") for an explicitly-empty env var, not Err
+        // (NotPresent). Treat empty as unset so `WARP_LLAMA_URL= ./warp-oss`
+        // cleanly reverts to upstream's hosted backend (and so a careless
+        // typo with no value doesn't construct an unusable URL).
+        let url = env::var("WARP_LLAMA_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        let url = url.trim().trim_end_matches('/').to_string();
+        let model = env::var("WARP_LLAMA_MODEL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "default".to_string());
         let api_key = env::var("WARP_LLAMA_API_KEY").ok().filter(|s| !s.is_empty());
         Some(Self {
             url,
@@ -67,6 +75,18 @@ mod tests {
     #[test]
     fn from_env_returns_none_when_url_unset() {
         with_env(&[("WARP_LLAMA_URL", None)], || {
+            assert!(Config::from_env().is_none());
+        });
+    }
+
+    #[test]
+    fn from_env_returns_none_when_url_empty() {
+        // `WARP_LLAMA_URL=` should cleanly fall through to upstream Warp,
+        // not engage the local backend with an unusable empty URL.
+        with_env(&[("WARP_LLAMA_URL", Some(""))], || {
+            assert!(Config::from_env().is_none());
+        });
+        with_env(&[("WARP_LLAMA_URL", Some("   "))], || {
             assert!(Config::from_env().is_none());
         });
     }
