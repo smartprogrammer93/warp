@@ -665,6 +665,44 @@ mod tests {
     }
 
     #[test]
+    fn mid_stream_invalid_api_key_error_maps_to_invalid_api_key_reason() {
+        let stream = openai_sse_to_proto_events(
+            futures::stream::iter(vec![Err::<String, _>(
+                LlamaBackendError::InvalidApiKey("nope".into()),
+            )]),
+            "conv-1".into(),
+            None,
+        );
+        let events = collect_all(stream);
+        let last = events.last().unwrap();
+        match &last.r#type {
+            Some(REType::Finished(f)) => {
+                assert!(matches!(f.reason, Some(Reason::InvalidApiKey(_))));
+            }
+            other => panic!("expected Finished::InvalidApiKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mid_stream_transport_error_maps_to_llm_unavailable() {
+        let stream = openai_sse_to_proto_events(
+            futures::stream::iter(vec![Err::<String, _>(
+                LlamaBackendError::Transport("connection refused".into()),
+            )]),
+            "conv-1".into(),
+            None,
+        );
+        let events = collect_all(stream);
+        let last = events.last().unwrap();
+        match &last.r#type {
+            Some(REType::Finished(f)) => {
+                assert!(matches!(f.reason, Some(Reason::LlmUnavailable(_))));
+            }
+            other => panic!("expected LlmUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn finish_reason_length_maps_to_max_token_limit() {
         let stream = openai_sse_to_proto_events(
             sse(&[r#"{"choices":[{"finish_reason":"length","delta":{}}]}"#]),

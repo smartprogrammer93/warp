@@ -48,10 +48,31 @@ pub type DispatchStream = BoxStream<'static, Result<ResponseEvent, anyhow::Error
 
 /// Process-wide conversation store. Each Warp process keeps one in-memory
 /// store shared across all turns of all conversations; cloning is cheap
-/// (Arc<DashMap> internally). Persistence to disk is added in Phase 10.3.
+/// (Arc<DashMap> internally). On first call we attempt to hydrate it from
+/// `$XDG_STATE_HOME/warp-llama/conversations/` (or `~/.local/state/...`);
+/// every subsequent upsert is also persisted there.
 fn store() -> ConversationStore {
     static STORE: OnceLock<ConversationStore> = OnceLock::new();
-    STORE.get_or_init(ConversationStore::new).clone()
+    STORE
+        .get_or_init(|| {
+            let dir = persist_dir();
+            ConversationStore::load_from_disk(&dir)
+        })
+        .clone()
+}
+
+fn persist_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| {
+                let mut p = std::path::PathBuf::from(h);
+                p.push(".local/state");
+                p
+            })
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    base.join("warp-llama").join("conversations")
 }
 
 /// Returns `Some(stream)` if `WARP_LLAMA_URL` is set, otherwise `None`.

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum OpenAIRole {
     System,
