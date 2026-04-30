@@ -15,7 +15,7 @@ account).
 ## Quick start
 
 ```sh
-cargo build --release --bin warp-oss --features gui
+cargo build --release --bin warp-oss --features 'gui,release_bundle'
 
 WARP_LLAMA_URL=http://192.168.8.68:8080 \
 WARP_LLAMA_MODEL=Qwen3.6-27B-UD-Q4_K_XL.gguf \
@@ -69,6 +69,18 @@ model's pick to `Tool::CallMcpTool { name, args, server_id }`.
 The other 25 `ToolType` variants Warp defines (suggest_plan, use_computer,
 start_agent, ask_user_question, …) are intentionally out of scope for v0.1 —
 the model never sees them.
+
+### Build features
+
+`--features 'gui,release_bundle'` is the right combination for a daily-driver
+binary. **Don't drop `release_bundle`**: it gates the Linux single-instance
+forwarder (`app/src/app_services/linux/mod.rs::pass_startup_args_to_existing_instance`).
+Without it, every `warposs://` URL — most importantly the OAuth callback —
+spawns a *new* warp-oss process instead of being routed to the running
+window via D-Bus, which makes login appear to silently fail. The flag
+itself is just a marker (it doesn't change `is_release_bundle()` behavior
+that we'd otherwise want false — telemetry/autoupdate are already disabled
+in `app/src/bin/oss.rs`).
 
 ## Architecture
 
